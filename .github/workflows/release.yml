@@ -1,0 +1,35 @@
+name: Build and publish plugin release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Build plugin
+        run: mvn --batch-mode package
+
+      - name: Create GitHub release and upload plugin JAR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp target/DogController-*.jar "DogController-${GITHUB_REF_NAME}.jar"
+          gh release create "$GITHUB_REF_NAME" "DogController-${GITHUB_REF_NAME}.jar" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
