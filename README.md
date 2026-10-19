@@ -27,17 +27,6 @@ If there are no releases yet, see [Creating a downloadable release](#creating-a-
 
 The plugin's commands are available to all players by default through the `dogcontroller.use` permission.
 
-## Creating a downloadable release
-
-GitHub does not make a plugin JAR available just because the source code is pushed. This repository is configured to build and attach the JAR to a GitHub Release when you push a version tag:
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-When the workflow finishes, the JAR will be available on the [Releases page](https://github.com/Nyxxiedev/DogController/releases/latest) with the versioned name `DogController-v1.0.0.jar`. Use a new tag for each release, such as `v1.0.1`.
-
 ## Build from source
 
 Requirements: JDK 25 and Maven.
