@@ -1,0 +1,18 @@
+main: com.DogController.project.DogController
+version: 1.0.0-SNAPSHOT
+name: DogController
+author: Nyxxie
+description: A minecraft plugin that lets you control your dogs better
+api-version: 1.21
+
+commands:
+  dogs:
+    description: Control your tamed dogs.
+    usage: /dogs <attack|passive|neutral|tp|defense>
+    aliases: [dog, dogcontroller]
+    permission: dogcontroller.use
+
+permissions:
+  dogcontroller.use:
+    description: Allows you to control your tamed dogs.
+    default: true
