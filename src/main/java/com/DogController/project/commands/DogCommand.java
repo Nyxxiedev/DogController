@@ -11,6 +11,8 @@ import org.bukkit.command.TabCompleter;
 import org.bukkit.entity.Player;
 import com.DogController.project.managers.DogControlManager;
 import com.DogController.project.managers.DogControlManager.Disposition;
+import com.DogController.project.managers.DogControlManager.TeleportRequestResult;
+import com.DogController.project.managers.DogControlManager.TeleportRequestStatus;
 import com.DogController.project.utils.Utils;
 
 public class DogCommand implements CommandExecutor, TabCompleter {
@@ -73,9 +75,18 @@ public class DogCommand implements CommandExecutor, TabCompleter {
             owner.sendMessage(Utils.colorize(PREFIX + "&cUsage: /dogs tp"));
             return;
         }
-        owner.sendMessage(Utils.colorize(PREFIX + "&eFinding your dogs and teleporting them safely..."));
-        dogControlManager.teleportDogs(owner, teleported -> owner.sendMessage(Utils.colorize(
-                PREFIX + "&aTeleported " + teleported + " dog(s) to you.")));
+        TeleportRequestResult result = dogControlManager.teleportDogs(owner,
+                teleported -> owner.sendMessage(Utils.colorize(
+                        PREFIX + "&aTeleported " + teleported + " dog(s) to you.")));
+        switch (result.status()) {
+            case QUEUED -> owner.sendMessage(Utils.colorize(
+                    PREFIX + "&eSummon queued. Dogs are processed gradually to reduce server load."));
+            case IN_PROGRESS -> owner.sendMessage(Utils.colorize(
+                    PREFIX + "&eYour dogs are already being summoned."));
+            case COOLDOWN -> owner.sendMessage(Utils.colorize(PREFIX + "&cPlease wait "
+                    + result.cooldownSecondsRemaining() + " second(s) before summoning again."));
+            case NO_DOGS -> owner.sendMessage(Utils.colorize(PREFIX + "&cNo tracked dogs were found."));
+        }
     }
 
     private void setDogsSitting(Player owner, String[] args, boolean sitting) {

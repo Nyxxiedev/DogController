@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -22,7 +24,6 @@ import org.bukkit.entity.Wolf;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
@@ -32,6 +33,7 @@ public class DogControlManager {
     private static final int MAX_TELEPORT_RINGS = 12;
     private static final int TELEPORT_RESISTANCE_TICKS = 60;
     private static final int TELEPORT_RESISTANCE_AMPLIFIER = 5;
+    private static final long TELEPORT_COOLDOWN_NANOS = 10_000_000_000L;
     private static final String TRACKED_WOLVES_KEY = "wolves";
 
     public enum Disposition {
@@ -40,13 +42,26 @@ public class DogControlManager {
         NEUTRAL
     }
 
+    public enum TeleportRequestStatus {
+        QUEUED,
+        IN_PROGRESS,
+        COOLDOWN,
+        NO_DOGS
+    }
+
+    public record TeleportRequestResult(TeleportRequestStatus status, long cooldownSecondsRemaining) {}
+
     private final Map<UUID, Map<UUID, Disposition>> dispositions = new HashMap<>();
     private final Set<UUID> defenseOwners = new HashSet<>();
     private final Map<UUID, TrackedDog> trackedDogs = new HashMap<>();
+    private final Set<UUID> teleportingOwners = new HashSet<>();
+    private final Map<UUID, Long> teleportCooldowns = new HashMap<>();
+    private final Deque<OwnedDogsRequest> ownedDogsQueue = new ArrayDeque<>();
     private final JavaPlugin plugin;
     private final File trackingFile;
     private final YamlConfiguration trackingData = new YamlConfiguration();
     private BukkitTask pendingSave;
+    private BukkitTask ownedDogsTask;
 
     public DogControlManager(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -85,6 +100,12 @@ public class DogControlManager {
     }
 
     public void saveAndStop() {
+        if (ownedDogsTask != null) {
+            ownedDogsTask.cancel();
+            ownedDogsTask = null;
+        }
+        ownedDogsQueue.clear();
+        teleportingOwners.clear();
         for (UUID dogId : new ArrayList<>(trackedDogs.keySet())) {
             if (Bukkit.getEntity(dogId) instanceof Wolf wolf && wolf.isValid() && !wolf.isDead()) {
                 trackWolf(wolf);
@@ -136,10 +157,28 @@ public class DogControlManager {
         return enabled;
     }
 
-    public void teleportDogs(Player owner, IntConsumer completion) {
+    public TeleportRequestResult teleportDogs(Player owner, IntConsumer completion) {
+        UUID ownerId = owner.getUniqueId();
+        if (teleportingOwners.contains(ownerId)) {
+            return new TeleportRequestResult(TeleportRequestStatus.IN_PROGRESS, 0);
+        }
+
+        long now = System.nanoTime();
+        teleportCooldowns.entrySet().removeIf(entry -> entry.getValue() <= now);
+        Long cooldownUntil = teleportCooldowns.get(ownerId);
+        if (cooldownUntil != null) {
+            long secondsRemaining = (cooldownUntil - now + 999_999_999L) / 1_000_000_000L;
+            return new TeleportRequestResult(TeleportRequestStatus.COOLDOWN, secondsRemaining);
+        }
+
+        if (trackedDogs.values().stream().noneMatch(dog -> dog.ownerId().equals(ownerId))) {
+            return new TeleportRequestResult(TeleportRequestStatus.NO_DOGS, 0);
+        }
+
         Location center = owner.getLocation().clone();
         List<Location> occupiedSpots = new ArrayList<>();
-        processOwnedDogs(owner, wolf -> {
+        teleportingOwners.add(ownerId);
+        boolean queued = processOwnedDogs(owner, wolf -> {
             Location destination = findTeleportSpot(center, occupiedSpots);
             if (destination == null || !wolf.teleport(destination)) {
                 return false;
@@ -148,7 +187,13 @@ public class DogControlManager {
                     TELEPORT_RESISTANCE_TICKS, TELEPORT_RESISTANCE_AMPLIFIER, false, false, false));
             occupiedSpots.add(destination);
             return true;
-        }, completion);
+        }, completion, () -> teleportingOwners.remove(ownerId));
+        if (!queued) {
+            teleportingOwners.remove(ownerId);
+            return new TeleportRequestResult(TeleportRequestStatus.NO_DOGS, 0);
+        }
+        teleportCooldowns.put(ownerId, now + TELEPORT_COOLDOWN_NANOS);
+        return new TeleportRequestResult(TeleportRequestStatus.QUEUED, 0);
     }
 
     public void setDogsSitting(Player owner, boolean sitting, IntConsumer completion) {
@@ -185,6 +230,11 @@ public class DogControlManager {
     }
 
     private void processOwnedDogs(Player owner, Predicate<Wolf> action, IntConsumer completion) {
+        processOwnedDogs(owner, action, completion, () -> {});
+    }
+
+    private boolean processOwnedDogs(Player owner, Predicate<Wolf> action, IntConsumer completion,
+            Runnable finished) {
         UUID ownerId = owner.getUniqueId();
 
         Map<ChunkKey, Set<UUID>> dogsByChunk = new LinkedHashMap<>();
@@ -199,55 +249,80 @@ public class DogControlManager {
 
         List<Map.Entry<ChunkKey, Set<UUID>>> chunks = new ArrayList<>(dogsByChunk.entrySet());
         if (chunks.isEmpty()) {
-            completion.accept(0);
+            if (owner.isOnline()) {
+                completion.accept(0);
+            }
+            finished.run();
+            return false;
+        }
+
+        ownedDogsQueue.addLast(new OwnedDogsRequest(owner, ownerId, chunks, action, completion, finished));
+        if (ownedDogsTask == null) {
+            ownedDogsTask = Bukkit.getScheduler().runTaskTimer(plugin, this::processNextOwnedDogsChunk, 1L, 1L);
+        }
+        return true;
+    }
+
+    private void processNextOwnedDogsChunk() {
+        OwnedDogsRequest request = ownedDogsQueue.pollFirst();
+        if (request == null) {
+            ownedDogsTask.cancel();
+            ownedDogsTask = null;
+            return;
+        }
+        if (!request.owner.isOnline()) {
+            finishOwnedDogsRequest(request);
+            stopOwnedDogsTaskIfIdle();
             return;
         }
 
-        new BukkitRunnable() {
-            private int nextChunk;
-            private int affected;
-
-            @Override
-            public void run() {
-                if (!owner.isOnline() || nextChunk >= chunks.size()) {
-                    cancel();
-                    if (owner.isOnline()) {
-                        completion.accept(affected);
-                    }
-                    return;
+        Map.Entry<ChunkKey, Set<UUID>> entry = request.chunks.get(request.nextChunk++);
+        ChunkKey key = entry.getKey();
+        World world = Bukkit.getWorld(key.worldId());
+        if (world != null && (world.isChunkLoaded(key.chunkX(), key.chunkZ())
+                || world.loadChunk(key.chunkX(), key.chunkZ(), false))) {
+            Chunk chunk = world.getChunkAt(key.chunkX(), key.chunkZ());
+            for (var entity : chunk.getEntities()) {
+                if (!(entity instanceof Wolf wolf) || !entry.getValue().contains(wolf.getUniqueId())) {
+                    continue;
                 }
-
-                Map.Entry<ChunkKey, Set<UUID>> entry = chunks.get(nextChunk++);
-                ChunkKey key = entry.getKey();
-                World world = Bukkit.getWorld(key.worldId());
-                if (world == null) {
-                    return;
+                AnimalTamer actualOwner = wolf.getOwner();
+                if (!wolf.isTamed() || actualOwner == null || !request.ownerId.equals(actualOwner.getUniqueId())) {
+                    trackedDogs.remove(wolf.getUniqueId());
+                    scheduleSave();
+                    continue;
                 }
-
-                if (!world.isChunkLoaded(key.chunkX(), key.chunkZ())
-                        && !world.loadChunk(key.chunkX(), key.chunkZ(), false)) {
-                    return;
-                }
-
-                Chunk chunk = world.getChunkAt(key.chunkX(), key.chunkZ());
-                for (var entity : chunk.getEntities()) {
-                    if (!(entity instanceof Wolf wolf) || !entry.getValue().contains(wolf.getUniqueId())) {
-                        continue;
-                    }
-                    AnimalTamer actualOwner = wolf.getOwner();
-                    if (!wolf.isTamed() || actualOwner == null || !ownerId.equals(actualOwner.getUniqueId())) {
-                        trackedDogs.remove(wolf.getUniqueId());
-                        scheduleSave();
-                        continue;
-                    }
-                    boolean changed = action.test(wolf);
-                    trackWolf(wolf);
-                    if (changed) {
-                        affected++;
-                    }
+                boolean changed = request.action.test(wolf);
+                trackWolf(wolf);
+                if (changed) {
+                    request.affected++;
                 }
             }
-        }.runTaskTimer(plugin, 0L, 1L);
+        }
+
+        if (request.nextChunk < request.chunks.size() && request.owner.isOnline()) {
+            ownedDogsQueue.addLast(request);
+        } else {
+            finishOwnedDogsRequest(request);
+        }
+        stopOwnedDogsTaskIfIdle();
+    }
+
+    private void finishOwnedDogsRequest(OwnedDogsRequest request) {
+        try {
+            if (request.owner.isOnline()) {
+                request.completion.accept(request.affected);
+            }
+        } finally {
+            request.finished.run();
+        }
+    }
+
+    private void stopOwnedDogsTaskIfIdle() {
+        if (ownedDogsQueue.isEmpty() && ownedDogsTask != null) {
+            ownedDogsTask.cancel();
+            ownedDogsTask = null;
+        }
     }
 
     private boolean hasSafeStandingSpace(Location location) {
@@ -454,4 +529,25 @@ public class DogControlManager {
     private record TrackedDog(UUID ownerId, UUID worldId, int chunkX, int chunkZ) {}
 
     private record ChunkKey(UUID worldId, int chunkX, int chunkZ) {}
+
+    private static final class OwnedDogsRequest {
+        private final Player owner;
+        private final UUID ownerId;
+        private final List<Map.Entry<ChunkKey, Set<UUID>>> chunks;
+        private final Predicate<Wolf> action;
+        private final IntConsumer completion;
+        private final Runnable finished;
+        private int nextChunk;
+        private int affected;
+
+        private OwnedDogsRequest(Player owner, UUID ownerId, List<Map.Entry<ChunkKey, Set<UUID>>> chunks,
+                Predicate<Wolf> action, IntConsumer completion, Runnable finished) {
+            this.owner = owner;
+            this.ownerId = ownerId;
+            this.chunks = chunks;
+            this.action = action;
+            this.completion = completion;
+            this.finished = finished;
+        }
+    }
 }
