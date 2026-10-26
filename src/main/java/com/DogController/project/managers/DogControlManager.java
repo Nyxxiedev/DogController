@@ -198,8 +198,11 @@ public class DogControlManager {
 
     public void setDogsSitting(Player owner, boolean sitting, IntConsumer completion) {
         processOwnedDogs(owner, wolf -> {
+            if (sitting) {
+                wolf.setTarget(null);
+            }
             wolf.setSitting(sitting);
-            return true;
+            return wolf.isSitting() == sitting;
         }, completion);
     }
 
@@ -278,25 +281,19 @@ public class DogControlManager {
 
         Map.Entry<ChunkKey, Set<UUID>> entry = request.chunks.get(request.nextChunk++);
         ChunkKey key = entry.getKey();
+        Set<UUID> unloadedDogs = new HashSet<>();
+        for (UUID dogId : entry.getValue()) {
+            if (!processTrackedDogIfLoaded(dogId, request)) {
+                unloadedDogs.add(dogId);
+            }
+        }
+
         World world = Bukkit.getWorld(key.worldId());
-        if (world != null && (world.isChunkLoaded(key.chunkX(), key.chunkZ())
-                || world.loadChunk(key.chunkX(), key.chunkZ(), false))) {
-            Chunk chunk = world.getChunkAt(key.chunkX(), key.chunkZ());
-            for (var entity : chunk.getEntities()) {
-                if (!(entity instanceof Wolf wolf) || !entry.getValue().contains(wolf.getUniqueId())) {
-                    continue;
-                }
-                AnimalTamer actualOwner = wolf.getOwner();
-                if (!wolf.isTamed() || actualOwner == null || !request.ownerId.equals(actualOwner.getUniqueId())) {
-                    trackedDogs.remove(wolf.getUniqueId());
-                    scheduleSave();
-                    continue;
-                }
-                boolean changed = request.action.test(wolf);
-                trackWolf(wolf);
-                if (changed) {
-                    request.affected++;
-                }
+        if (!unloadedDogs.isEmpty() && world != null
+                && (world.isChunkLoaded(key.chunkX(), key.chunkZ())
+                        || world.loadChunk(key.chunkX(), key.chunkZ(), false))) {
+            for (UUID dogId : unloadedDogs) {
+                processTrackedDogIfLoaded(dogId, request);
             }
         }
 
@@ -306,6 +303,32 @@ public class DogControlManager {
             finishOwnedDogsRequest(request);
         }
         stopOwnedDogsTaskIfIdle();
+    }
+
+    private boolean processTrackedDogIfLoaded(UUID dogId, OwnedDogsRequest request) {
+        var entity = Bukkit.getEntity(dogId);
+        if (entity == null) {
+            return false;
+        }
+        if (!(entity instanceof Wolf wolf) || !wolf.isValid() || wolf.isDead()) {
+            trackedDogs.remove(dogId);
+            scheduleSave();
+            return true;
+        }
+
+        AnimalTamer actualOwner = wolf.isTamed() ? wolf.getOwner() : null;
+        if (actualOwner == null || !request.ownerId.equals(actualOwner.getUniqueId())) {
+            trackedDogs.remove(dogId);
+            scheduleSave();
+            return true;
+        }
+
+        boolean changed = request.action.test(wolf);
+        trackWolf(wolf);
+        if (changed) {
+            request.affected++;
+        }
+        return true;
     }
 
     private void finishOwnedDogsRequest(OwnedDogsRequest request) {

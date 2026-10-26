@@ -96,8 +96,8 @@ public class DogCommand implements CommandExecutor, TabCompleter {
         }
         owner.sendMessage(Utils.colorize(PREFIX + "&eFinding your dogs..."));
         dogControlManager.setDogsSitting(owner, sitting, affected -> owner.sendMessage(Utils.colorize(
-                PREFIX + (sitting ? "&aYour dogs are sitting." : "&aYour dogs are standing.")
-                        + " &7(" + affected + " dog(s))")));
+                PREFIX + (sitting ? "&aSitting order applied to " : "&aStanding order applied to ")
+                        + affected + " dog(s).")));
     }
 
     private void setDefense(Player owner, String[] args) {
