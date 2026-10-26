@@ -37,6 +37,8 @@ public class DogCommand implements CommandExecutor, TabCompleter {
             case "passive" -> setDisposition(player, args, Disposition.PASSIVE);
             case "neutral" -> setDisposition(player, args, Disposition.NEUTRAL);
             case "tp", "teleport" -> teleportDogs(player, args);
+            case "sit" -> setDogsSitting(player, args, true);
+            case "stand" -> setDogsSitting(player, args, false);
             case "defense", "defence" -> setDefense(player, args);
             default -> sendUsage(player, label);
         }
@@ -71,8 +73,20 @@ public class DogCommand implements CommandExecutor, TabCompleter {
             owner.sendMessage(Utils.colorize(PREFIX + "&cUsage: /dogs tp"));
             return;
         }
-        int teleported = dogControlManager.teleportDogs(owner);
-        owner.sendMessage(Utils.colorize(PREFIX + "&aTeleported " + teleported + " dog(s) to you."));
+        owner.sendMessage(Utils.colorize(PREFIX + "&eFinding your dogs and teleporting them safely..."));
+        dogControlManager.teleportDogs(owner, teleported -> owner.sendMessage(Utils.colorize(
+                PREFIX + "&aTeleported " + teleported + " dog(s) to you.")));
+    }
+
+    private void setDogsSitting(Player owner, String[] args, boolean sitting) {
+        if (args.length != 1) {
+            owner.sendMessage(Utils.colorize(PREFIX + "&cUsage: /dogs " + (sitting ? "sit" : "stand")));
+            return;
+        }
+        owner.sendMessage(Utils.colorize(PREFIX + "&eFinding your dogs..."));
+        dogControlManager.setDogsSitting(owner, sitting, affected -> owner.sendMessage(Utils.colorize(
+                PREFIX + (sitting ? "&aYour dogs are sitting." : "&aYour dogs are standing.")
+                        + " &7(" + affected + " dog(s))")));
     }
 
     private void setDefense(Player owner, String[] args) {
@@ -100,13 +114,15 @@ public class DogCommand implements CommandExecutor, TabCompleter {
         player.sendMessage(Utils.colorize("&6/" + label + " passive <player> &7- make your dogs ignore a player"));
         player.sendMessage(Utils.colorize("&6/" + label + " neutral <player> &7- clear your dogs' player-specific order"));
         player.sendMessage(Utils.colorize("&6/" + label + " tp &7- teleport your dogs to you"));
+        player.sendMessage(Utils.colorize("&6/" + label + " sit &7- make your dogs sit"));
+        player.sendMessage(Utils.colorize("&6/" + label + " stand &7- make your dogs stand"));
         player.sendMessage(Utils.colorize("&6/" + label + " defense [on|off] &7- protect yourself from nearby players"));
     }
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
         if (args.length == 1) {
-            return matching(List.of("attack", "passive", "neutral", "tp", "defense"), args[0]);
+            return matching(List.of("attack", "passive", "neutral", "tp", "sit", "stand", "defense"), args[0]);
         }
         if (args.length == 2 && List.of("attack", "agro", "aggro", "passive", "neutral").contains(args[0].toLowerCase(Locale.ROOT))) {
             List<String> names = new ArrayList<>();

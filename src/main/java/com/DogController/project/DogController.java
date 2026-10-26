@@ -8,15 +8,17 @@ import com.DogController.project.commands.DogCommand;
 import com.DogController.project.listeners.PlayerListener;
 
 public class DogController extends JavaPlugin {
-    
+    private DogControlManager dogControlManager;
+
     @Override
     public void onEnable() {
-        
+
         // Initialize managers
         PluginManager.getInstance().initialize();
 
-        DogControlManager dogControlManager = new DogControlManager();
+        dogControlManager = new DogControlManager(this);
         getServer().getPluginManager().registerEvents(new PlayerListener(dogControlManager), this);
+        dogControlManager.trackLoadedDogs();
 
         DogCommand dogCommand = new DogCommand(dogControlManager);
         PluginCommand dogsCommand = getCommand("dogs");
@@ -33,7 +35,10 @@ public class DogController extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        if (dogControlManager != null) {
+            dogControlManager.saveAndStop();
+        }
         getLogger().info(getDescription().getName() + " has been disabled!");
     }
-    
+
 }

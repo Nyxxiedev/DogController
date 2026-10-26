@@ -8,7 +8,7 @@ api-version: 1.21
 commands:
   dogs:
     description: Control your tamed dogs.
-    usage: /dogs <attack|passive|neutral|tp|defense>
+    usage: /dogs <attack|passive|neutral|tp|sit|stand|defense>
     aliases: [dog, dogcontroller]
     permission: dogcontroller.use
 
