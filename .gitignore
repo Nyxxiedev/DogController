@@ -2,3 +2,13 @@ target/
 .metals/
 .bloop/
 .vscode/
+
+__pycache__/
+*.pyc
+
+# AI/assistant tooling
+AGENTS.md
+docs/superpowers/
+.github/workflows/compat.yml
+scripts/verify_versions.py
+compat/

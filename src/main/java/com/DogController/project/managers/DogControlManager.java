@@ -2,11 +2,12 @@ package com.DogController.project.managers;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.ArrayList;
-import java.util.ArrayDeque;
-import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,16 +18,20 @@ import java.util.function.Predicate;
 import org.bukkit.Bukkit;
 import org.bukkit.Chunk;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.block.Block;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.InvalidConfigurationException;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.AnimalTamer;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Wolf;
-import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
-import org.bukkit.configuration.InvalidConfigurationException;
-import org.bukkit.configuration.file.YamlConfiguration;
+import com.DogController.project.utils.ServerCompat;
 
 public class DogControlManager {
     private static final double DEFENSE_RADIUS = 12.0;
@@ -49,11 +54,28 @@ public class DogControlManager {
         NO_DOGS
     }
 
-    public record TeleportRequestResult(TeleportRequestStatus status, long cooldownSecondsRemaining) {}
+    public static final class TeleportRequestResult {
+        private final TeleportRequestStatus status;
+        private final long cooldownSecondsRemaining;
+
+        public TeleportRequestResult(TeleportRequestStatus status, long cooldownSecondsRemaining) {
+            this.status = status;
+            this.cooldownSecondsRemaining = cooldownSecondsRemaining;
+        }
+
+        public TeleportRequestStatus status() {
+            return status;
+        }
+
+        public long cooldownSecondsRemaining() {
+            return cooldownSecondsRemaining;
+        }
+    }
 
     private final Map<UUID, Map<UUID, Disposition>> dispositions = new HashMap<>();
     private final Set<UUID> defenseOwners = new HashSet<>();
     private final Map<UUID, TrackedDog> trackedDogs = new HashMap<>();
+    private final Map<UUID, Wolf> liveWolves = new HashMap<>();
     private final Set<UUID> teleportingOwners = new HashSet<>();
     private final Map<UUID, Long> teleportCooldowns = new HashMap<>();
     private final Deque<OwnedDogsRequest> ownedDogsQueue = new ArrayDeque<>();
@@ -62,6 +84,7 @@ public class DogControlManager {
     private final YamlConfiguration trackingData = new YamlConfiguration();
     private BukkitTask pendingSave;
     private BukkitTask ownedDogsTask;
+    private boolean warnedMissingResistance;
 
     public DogControlManager(JavaPlugin plugin) {
         this.plugin = plugin;
@@ -78,14 +101,14 @@ public class DogControlManager {
     }
 
     public void trackChunkDogs(Chunk chunk) {
-        for (var entity : chunk.getEntities()) {
-            if (entity instanceof Wolf wolf) {
-                trackWolf(wolf);
+        for (Entity entity : chunk.getEntities()) {
+            if (entity instanceof Wolf) {
+                trackWolf((Wolf) entity);
             }
         }
     }
 
-    public void trackTamedWolfNextTick(Wolf wolf) {
+    public void trackTamedWolfNextTick(final Wolf wolf) {
         Bukkit.getScheduler().runTask(plugin, () -> {
             if (wolf.isValid() && !wolf.isDead()) {
                 trackWolf(wolf);
@@ -94,9 +117,30 @@ public class DogControlManager {
     }
 
     public void onWolfDeath(Wolf wolf) {
+        liveWolves.remove(wolf.getUniqueId());
         if (trackedDogs.remove(wolf.getUniqueId()) != null) {
             scheduleSave();
         }
+    }
+
+    public void onChunkUnload(Chunk chunk) {
+        // Preserve the old behaviour: refresh the persisted location first.
+        trackChunkDogs(chunk);
+
+        final UUID worldId = chunk.getWorld().getUID();
+        final int chunkX = chunk.getX();
+        final int chunkZ = chunk.getZ();
+        liveWolves.entrySet().removeIf(entry -> {
+            Wolf wolf = entry.getValue();
+            if (!wolf.isValid() || wolf.isDead()) {
+                return true;
+            }
+            Location location = wolf.getLocation();
+            return location.getWorld() != null
+                    && location.getWorld().getUID().equals(worldId)
+                    && location.getBlockX() >> 4 == chunkX
+                    && location.getBlockZ() >> 4 == chunkZ;
+        });
     }
 
     public void saveAndStop() {
@@ -107,7 +151,8 @@ public class DogControlManager {
         ownedDogsQueue.clear();
         teleportingOwners.clear();
         for (UUID dogId : new ArrayList<>(trackedDogs.keySet())) {
-            if (Bukkit.getEntity(dogId) instanceof Wolf wolf && wolf.isValid() && !wolf.isDead()) {
+            Wolf wolf = liveWolf(dogId);
+            if (wolf != null && wolf.isValid() && !wolf.isDead()) {
                 trackWolf(wolf);
             }
         }
@@ -116,10 +161,11 @@ public class DogControlManager {
             pendingSave = null;
         }
         saveTrackedDogs();
+        liveWolves.clear();
     }
 
     public void setDisposition(Player owner, Player target, Disposition disposition) {
-        dispositions.computeIfAbsent(owner.getUniqueId(), ignored -> new HashMap<>())
+        dispositions.computeIfAbsent(owner.getUniqueId(), ignored -> new HashMap<UUID, Disposition>())
                 .put(target.getUniqueId(), disposition);
         processOwnedDogs(owner, wolf -> {
             if (disposition == Disposition.AGGRESSIVE) {
@@ -135,7 +181,7 @@ public class DogControlManager {
     }
 
     public Disposition getDisposition(UUID ownerId, UUID targetId) {
-        return dispositions.getOrDefault(ownerId, Map.of())
+        return dispositions.getOrDefault(ownerId, Collections.<UUID, Disposition>emptyMap())
                 .getOrDefault(targetId, Disposition.NEUTRAL);
     }
 
@@ -171,20 +217,36 @@ public class DogControlManager {
             return new TeleportRequestResult(TeleportRequestStatus.COOLDOWN, secondsRemaining);
         }
 
-        if (trackedDogs.values().stream().noneMatch(dog -> dog.ownerId().equals(ownerId))) {
+        boolean hasTrackedDog = false;
+        for (TrackedDog dog : trackedDogs.values()) {
+            if (dog.ownerId().equals(ownerId)) {
+                hasTrackedDog = true;
+                break;
+            }
+        }
+        if (!hasTrackedDog) {
             return new TeleportRequestResult(TeleportRequestStatus.NO_DOGS, 0);
         }
 
-        Location center = owner.getLocation().clone();
-        List<Location> occupiedSpots = new ArrayList<>();
+        final Location center = owner.getLocation().clone();
+        final List<Location> occupiedSpots = new ArrayList<>();
+        final PotionEffectType resistance = ServerCompat.resistanceType();
+        if (resistance == null && !warnedMissingResistance) {
+            warnedMissingResistance = true;
+            plugin.getLogger().warning(
+                    "Resistance potion type is unavailable on this server; teleport resistance will be skipped.");
+        }
+
         teleportingOwners.add(ownerId);
         boolean queued = processOwnedDogs(owner, wolf -> {
             Location destination = findTeleportSpot(center, occupiedSpots);
             if (destination == null || !wolf.teleport(destination)) {
                 return false;
             }
-            wolf.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE,
-                    TELEPORT_RESISTANCE_TICKS, TELEPORT_RESISTANCE_AMPLIFIER, false, false, false));
+            if (resistance != null) {
+                wolf.addPotionEffect(ServerCompat.createHiddenEffect(resistance,
+                        TELEPORT_RESISTANCE_TICKS, TELEPORT_RESISTANCE_AMPLIFIER));
+            }
             occupiedSpots.add(destination);
             return true;
         }, completion, () -> teleportingOwners.remove(ownerId));
@@ -207,6 +269,7 @@ public class DogControlManager {
     }
 
     private Location findTeleportSpot(Location center, List<Location> occupiedSpots) {
+        World world = center.getWorld();
         for (int ring = 1; ring <= MAX_TELEPORT_RINGS; ring++) {
             for (int offsetX = -ring; offsetX <= ring; offsetX++) {
                 for (int offsetZ = -ring; offsetZ <= ring; offsetZ++) {
@@ -215,7 +278,6 @@ public class DogControlManager {
                     }
                     int blockX = center.getBlockX() + offsetX;
                     int blockZ = center.getBlockZ() + offsetZ;
-                    World world = center.getWorld();
                     if (!world.isChunkLoaded(blockX >> 4, blockZ >> 4)) {
                         continue;
                     }
@@ -247,7 +309,12 @@ public class DogControlManager {
                 continue;
             }
             ChunkKey chunkKey = new ChunkKey(dog.worldId(), dog.chunkX(), dog.chunkZ());
-            dogsByChunk.computeIfAbsent(chunkKey, ignored -> new HashSet<>()).add(entry.getKey());
+            Set<UUID> dogs = dogsByChunk.get(chunkKey);
+            if (dogs == null) {
+                dogs = new HashSet<>();
+                dogsByChunk.put(chunkKey, dogs);
+            }
+            dogs.add(entry.getKey());
         }
 
         List<Map.Entry<ChunkKey, Set<UUID>>> chunks = new ArrayList<>(dogsByChunk.entrySet());
@@ -269,8 +336,10 @@ public class DogControlManager {
     private void processNextOwnedDogsChunk() {
         OwnedDogsRequest request = ownedDogsQueue.pollFirst();
         if (request == null) {
-            ownedDogsTask.cancel();
-            ownedDogsTask = null;
+            if (ownedDogsTask != null) {
+                ownedDogsTask.cancel();
+                ownedDogsTask = null;
+            }
             return;
         }
         if (!request.owner.isOnline()) {
@@ -289,11 +358,16 @@ public class DogControlManager {
         }
 
         World world = Bukkit.getWorld(key.worldId());
-        if (!unloadedDogs.isEmpty() && world != null
-                && (world.isChunkLoaded(key.chunkX(), key.chunkZ())
-                        || world.loadChunk(key.chunkX(), key.chunkZ(), false))) {
-            for (UUID dogId : unloadedDogs) {
-                processTrackedDogIfLoaded(dogId, request);
+        if (!unloadedDogs.isEmpty() && world != null) {
+            boolean loaded = world.isChunkLoaded(key.chunkX(), key.chunkZ());
+            if (!loaded) {
+                loaded = world.loadChunk(key.chunkX(), key.chunkZ(), false);
+            }
+            if (loaded) {
+                trackChunkDogs(world.getChunkAt(key.chunkX(), key.chunkZ()));
+                for (UUID dogId : unloadedDogs) {
+                    processTrackedDogIfLoaded(dogId, request);
+                }
             }
         }
 
@@ -306,20 +380,18 @@ public class DogControlManager {
     }
 
     private boolean processTrackedDogIfLoaded(UUID dogId, OwnedDogsRequest request) {
-        var entity = Bukkit.getEntity(dogId);
-        if (entity == null) {
+        Wolf wolf = liveWolf(dogId);
+        if (wolf == null) {
             return false;
         }
-        if (!(entity instanceof Wolf wolf) || !wolf.isValid() || wolf.isDead()) {
-            trackedDogs.remove(dogId);
-            scheduleSave();
+        if (!wolf.isValid() || wolf.isDead()) {
+            removeTrackedDog(dogId);
             return true;
         }
 
         AnimalTamer actualOwner = wolf.isTamed() ? wolf.getOwner() : null;
         if (actualOwner == null || !request.ownerId.equals(actualOwner.getUniqueId())) {
-            trackedDogs.remove(dogId);
-            scheduleSave();
+            removeTrackedDog(dogId);
             return true;
         }
 
@@ -349,10 +421,18 @@ public class DogControlManager {
     }
 
     private boolean hasSafeStandingSpace(Location location) {
-        var feet = location.getBlock();
-        var head = feet.getRelative(0, 1, 0);
-        var ground = feet.getRelative(0, -1, 0);
-        return feet.getType().isAir() && head.getType().isAir() && ground.getType().isSolid();
+        Block feet = location.getBlock();
+        Block head = feet.getRelative(0, 1, 0);
+        Block ground = feet.getRelative(0, -1, 0);
+        return isAir(feet.getType()) && isAir(head.getType()) && ground.getType().isSolid();
+    }
+
+    private static boolean isAir(Material material) {
+        if (material == Material.AIR) {
+            return true;
+        }
+        String name = material.name();
+        return "CAVE_AIR".equals(name) || "VOID_AIR".equals(name);
     }
 
     private boolean isTooClose(Location candidate, List<Location> occupiedSpots) {
@@ -391,7 +471,8 @@ public class DogControlManager {
     private Player findAggressiveTarget(UUID ownerId, Wolf wolf) {
         Player closest = null;
         double closestDistance = Double.MAX_VALUE;
-        Map<UUID, Disposition> ownerDispositions = dispositions.getOrDefault(ownerId, Map.of());
+        Map<UUID, Disposition> ownerDispositions = dispositions.getOrDefault(ownerId,
+                Collections.<UUID, Disposition>emptyMap());
         for (Map.Entry<UUID, Disposition> entry : ownerDispositions.entrySet()) {
             if (entry.getValue() != Disposition.AGGRESSIVE) {
                 continue;
@@ -439,24 +520,25 @@ public class DogControlManager {
 
     private List<Wolf> getOwnedWolves(UUID ownerId) {
         List<Wolf> wolves = new ArrayList<>();
-        List<UUID> dogIds = trackedDogs.entrySet().stream()
-                .filter(entry -> entry.getValue().ownerId().equals(ownerId))
-                .map(Map.Entry::getKey)
-                .toList();
+        List<UUID> dogIds = new ArrayList<>();
+        for (Map.Entry<UUID, TrackedDog> entry : trackedDogs.entrySet()) {
+            if (entry.getValue().ownerId().equals(ownerId)) {
+                dogIds.add(entry.getKey());
+            }
+        }
         for (UUID dogId : dogIds) {
-            if (!(Bukkit.getEntity(dogId) instanceof Wolf wolf)) {
+            Wolf wolf = liveWolf(dogId);
+            if (wolf == null) {
                 continue;
             }
             if (!wolf.isValid() || wolf.isDead()) {
-                trackedDogs.remove(dogId);
-                scheduleSave();
+                removeTrackedDog(dogId);
                 continue;
             }
 
             AnimalTamer owner = wolf.isTamed() ? wolf.getOwner() : null;
             if (owner == null) {
-                trackedDogs.remove(dogId);
-                scheduleSave();
+                removeTrackedDog(dogId);
                 continue;
             }
 
@@ -468,19 +550,70 @@ public class DogControlManager {
         return wolves;
     }
 
+    /**
+     * Resolves a tracked dog to a live entity without forcing a chunk load, mirroring the old
+     * {@code Bukkit.getEntity(UUID)} lookups on API versions where that method does not exist.
+     *
+     * <p>Tracked wolves are cached when their chunk loads and stay cached while they move
+     * between loaded chunks. A miss therefore means the dog's chunk is unloaded; the targeted
+     * chunk scan also covers the first lookup after a server start on 1.8-1.10.
+     */
+    private Wolf liveWolf(UUID dogId) {
+        Wolf cached = liveWolves.get(dogId);
+        if (cached != null && cached.isValid() && !cached.isDead()) {
+            return cached;
+        }
+
+        Entity entity = ServerCompat.getEntity(dogId);
+        if (entity instanceof Wolf) {
+            Wolf wolf = (Wolf) entity;
+            liveWolves.put(dogId, wolf);
+            return wolf;
+        }
+
+        TrackedDog trackedDog = trackedDogs.get(dogId);
+        if (trackedDog == null) {
+            return null;
+        }
+        World world = Bukkit.getWorld(trackedDog.worldId());
+        if (world == null) {
+            return null;
+        }
+
+        if (world.isChunkLoaded(trackedDog.chunkX(), trackedDog.chunkZ())) {
+            for (Entity candidate : world.getChunkAt(trackedDog.chunkX(), trackedDog.chunkZ()).getEntities()) {
+                if (candidate instanceof Wolf && dogId.equals(candidate.getUniqueId())) {
+                    Wolf wolf = (Wolf) candidate;
+                    liveWolves.put(dogId, wolf);
+                    return wolf;
+                }
+            }
+        }
+        return null;
+    }
+
     private void trackWolf(Wolf wolf) {
         UUID wolfId = wolf.getUniqueId();
         AnimalTamer owner = wolf.isTamed() ? wolf.getOwner() : null;
         if (owner == null) {
+            liveWolves.remove(wolfId);
             if (trackedDogs.remove(wolfId) != null) {
                 scheduleSave();
             }
             return;
         }
 
+        liveWolves.put(wolfId, wolf);
         TrackedDog trackedDog = new TrackedDog(owner.getUniqueId(), wolf.getWorld().getUID(),
                 wolf.getLocation().getChunk().getX(), wolf.getLocation().getChunk().getZ());
         if (!trackedDog.equals(trackedDogs.put(wolfId, trackedDog))) {
+            scheduleSave();
+        }
+    }
+
+    private void removeTrackedDog(UUID dogId) {
+        liveWolves.remove(dogId);
+        if (trackedDogs.remove(dogId) != null) {
             scheduleSave();
         }
     }
@@ -496,7 +629,7 @@ public class DogControlManager {
             throw new IllegalStateException("Could not load tracked dog locations from " + trackingFile, exception);
         }
 
-        var section = trackingData.getConfigurationSection(TRACKED_WOLVES_KEY);
+        ConfigurationSection section = trackingData.getConfigurationSection(TRACKED_WOLVES_KEY);
         if (section == null) {
             return;
         }
@@ -549,9 +682,105 @@ public class DogControlManager {
         }
     }
 
-    private record TrackedDog(UUID ownerId, UUID worldId, int chunkX, int chunkZ) {}
+    private static final class TrackedDog {
+        private final UUID ownerId;
+        private final UUID worldId;
+        private final int chunkX;
+        private final int chunkZ;
 
-    private record ChunkKey(UUID worldId, int chunkX, int chunkZ) {}
+        private TrackedDog(UUID ownerId, UUID worldId, int chunkX, int chunkZ) {
+            this.ownerId = ownerId;
+            this.worldId = worldId;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+        }
+
+        private UUID ownerId() {
+            return ownerId;
+        }
+
+        private UUID worldId() {
+            return worldId;
+        }
+
+        private int chunkX() {
+            return chunkX;
+        }
+
+        private int chunkZ() {
+            return chunkZ;
+        }
+
+        @Override
+        public boolean equals(Object object) {
+            if (this == object) {
+                return true;
+            }
+            if (!(object instanceof TrackedDog)) {
+                return false;
+            }
+            TrackedDog other = (TrackedDog) object;
+            return chunkX == other.chunkX
+                    && chunkZ == other.chunkZ
+                    && ownerId.equals(other.ownerId)
+                    && worldId.equals(other.worldId);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = ownerId.hashCode();
+            result = 31 * result + worldId.hashCode();
+            result = 31 * result + chunkX;
+            result = 31 * result + chunkZ;
+            return result;
+        }
+    }
+
+    private static final class ChunkKey {
+        private final UUID worldId;
+        private final int chunkX;
+        private final int chunkZ;
+
+        private ChunkKey(UUID worldId, int chunkX, int chunkZ) {
+            this.worldId = worldId;
+            this.chunkX = chunkX;
+            this.chunkZ = chunkZ;
+        }
+
+        private UUID worldId() {
+            return worldId;
+        }
+
+        private int chunkX() {
+            return chunkX;
+        }
+
+        private int chunkZ() {
+            return chunkZ;
+        }
+
+        @Override
+        public boolean equals(Object object) {
+            if (this == object) {
+                return true;
+            }
+            if (!(object instanceof ChunkKey)) {
+                return false;
+            }
+            ChunkKey other = (ChunkKey) object;
+            return chunkX == other.chunkX
+                    && chunkZ == other.chunkZ
+                    && worldId.equals(other.worldId);
+        }
+
+        @Override
+        public int hashCode() {
+            int result = worldId.hashCode();
+            result = 31 * result + chunkX;
+            result = 31 * result + chunkZ;
+            return result;
+        }
+    }
 
     private static final class OwnedDogsRequest {
         private final Player owner;

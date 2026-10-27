@@ -1,20 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-            xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://www.apache.org/xsd/maven-4.0.0.xsd">
+            xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.DogController.project</groupId>
     <artifactId>DogController</artifactId>
     <version>1.1.0-SNAPSHOT</version>
-    
+
     <name>DogController</name>
     <url>https://example.com</url>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <maven.compiler.source>25</maven.compiler.source>
-        <maven.compiler.target>25</maven.compiler.target>
+        <!-- Java 8 is the lowest runtime we support (Minecraft 1.8.8). -->
+        <maven.compiler.release>8</maven.compiler.release>
+        <!-- Compile against the oldest API; the compat layer covers newer servers. -->
+        <spigot.version>1.8.8-R0.1-SNAPSHOT</spigot.version>
+        <junit.version>5.11.4</junit.version>
     </properties>
 
     <repositories>
@@ -22,21 +25,39 @@
             <id>spigot-repo</id>
             <url>https://hub.spigotmc.org/nexus/content/repositories/snapshots/</url>
         </repository>
+        <!-- Supplies bungeecord-chat, a transitive dependency of old spigot-api. -->
+        <repository>
+            <id>papermc-repo</id>
+            <url>https://repo.papermc.io/repository/maven-public/</url>
+        </repository>
     </repositories>
 
     <dependencies>
         <dependency>
             <groupId>org.spigotmc</groupId>
             <artifactId>spigot-api</artifactId>
-            <version>26.3-R0.1-SNAPSHOT</version>
+            <version>${spigot.version}</version>
             <scope>provided</scope>
         </dependency>
 
-
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
         <sourceDirectory>${project.basedir}/src/main/java</sourceDirectory>
+        <!--
+          Keep compiled classes outside the project path. javac treats ':' in a
+          Unix classpath entry as a separator, so a project directory containing
+          ':' (for example "MC:Plugins") would make the test classpath invalid.
+          The JAR is still written to target/.
+        -->
+        <outputDirectory>${java.io.tmpdir}/dogcontroller-build/classes</outputDirectory>
+        <testOutputDirectory>${java.io.tmpdir}/dogcontroller-build/test-classes</testOutputDirectory>
         <resources>
             <resource>
                 <directory>${project.basedir}/src/main/resources</directory>
@@ -44,8 +65,38 @@
             </resource>
         </resources>
         <plugins>
-
-
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-clean-plugin</artifactId>
+                <version>3.4.0</version>
+                <configuration>
+                    <filesets>
+                        <fileset>
+                            <directory>${java.io.tmpdir}/dogcontroller-build</directory>
+                        </fileset>
+                    </filesets>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                    <compilerArgs>
+                        <arg>-Xlint:-options</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <!-- In-process avoids a forked booter classpath containing ':'. -->
+                    <forkCount>0</forkCount>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>

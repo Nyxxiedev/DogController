@@ -22,8 +22,12 @@ public class PlayerListener implements Listener {
 
     @EventHandler
     public void onWolfTarget(EntityTargetLivingEntityEvent event) {
-        if (!(event.getEntity() instanceof Wolf wolf) || !(event.getTarget() instanceof Player target)
-                || !wolf.isTamed()) {
+        if (!(event.getEntity() instanceof Wolf) || !(event.getTarget() instanceof Player)) {
+            return;
+        }
+        Wolf wolf = (Wolf) event.getEntity();
+        Player target = (Player) event.getTarget();
+        if (!wolf.isTamed()) {
             return;
         }
         AnimalTamer owner = wolf.getOwner();
@@ -39,20 +43,20 @@ public class PlayerListener implements Listener {
 
     @EventHandler
     public void onChunkUnload(ChunkUnloadEvent event) {
-        dogControlManager.trackChunkDogs(event.getChunk());
+        dogControlManager.onChunkUnload(event.getChunk());
     }
 
     @EventHandler
     public void onWolfTamed(EntityTameEvent event) {
-        if (event.getEntity() instanceof Wolf wolf) {
-            dogControlManager.trackTamedWolfNextTick(wolf);
+        if (event.getEntity() instanceof Wolf) {
+            dogControlManager.trackTamedWolfNextTick((Wolf) event.getEntity());
         }
     }
 
     @EventHandler
     public void onWolfDeath(EntityDeathEvent event) {
-        if (event.getEntity() instanceof Wolf wolf) {
-            dogControlManager.onWolfDeath(wolf);
+        if (event.getEntity() instanceof Wolf) {
+            dogControlManager.onWolfDeath((Wolf) event.getEntity());
         }
     }
 }
